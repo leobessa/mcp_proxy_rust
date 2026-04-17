@@ -35,11 +35,8 @@ impl Echo {
 #[tool_handler]
 impl rmcp::ServerHandler for Echo {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("A simple echo server".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("A simple echo server".to_string())
     }
 }
 
