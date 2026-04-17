@@ -3,9 +3,10 @@ use crate::core::{
     process_buffered_messages, process_client_request, reply_disconnected,
     send_heartbeat_if_needed, try_reconnect,
 };
-use crate::{SseClientType, StdoutSink};
+use crate::{McpTransport, StdoutSink};
 use anyhow::Result;
 use futures::SinkExt;
+use rmcp::transport::Transport;
 use rmcp::model::{
     ClientJsonRpcMessage, ClientNotification, ClientRequest, EmptyResult, InitializedNotification,
     InitializedNotificationMethod, ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerResult,
@@ -193,7 +194,7 @@ impl AppState {
         msg: Option<
             Result<ClientJsonRpcMessage, rmcp::transport::async_rw::JsonRpcMessageCodecError>,
         >,
-        transport: &mut SseClientType,
+        transport: &mut McpTransport,
         stdout_sink: &mut StdoutSink,
     ) -> Result<bool> {
         match msg {
@@ -217,7 +218,7 @@ impl AppState {
     pub(crate) async fn handle_sse_message(
         &mut self,
         result: Option<ServerJsonRpcMessage>,
-        transport: &mut SseClientType,
+        transport: &mut McpTransport,
         stdout_sink: &mut StdoutSink,
     ) -> Result<bool> {
         debug!("Received SSE message: {:?}", result);
@@ -359,7 +360,7 @@ impl AppState {
     pub(crate) async fn handle_reconnect_signal(
         &mut self,
         stdout_sink: &mut StdoutSink,
-    ) -> Result<Option<SseClientType>> {
+    ) -> Result<Option<McpTransport>> {
         debug!("Received reconnect signal");
         self.reconnect_scheduled = false;
 
@@ -426,7 +427,7 @@ impl AppState {
     /// Handles the heartbeat interval tick.
     pub(crate) async fn handle_heartbeat_tick(
         &mut self,
-        transport: &mut SseClientType,
+        transport: &mut McpTransport,
     ) -> Result<()> {
         if self.state == ProxyState::Connected {
             let check_result = send_heartbeat_if_needed(self, transport).await;
