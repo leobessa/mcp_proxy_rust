@@ -1,22 +1,20 @@
 use crate::state::{AppState, BufferMode, ProxyState, ReconnectFailureReason};
-use crate::{DISCONNECTED_ERROR_CODE, SseClientType, StdoutSink, TRANSPORT_SEND_ERROR_CODE};
-use anyhow::{Result, anyhow};
+use crate::{DISCONNECTED_ERROR_CODE, McpTransport, StdoutSink, TRANSPORT_SEND_ERROR_CODE};
+use anyhow::Result;
 use futures::FutureExt;
 use futures::SinkExt;
 use rmcp::model::{
     ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, RequestId,
     ServerJsonRpcMessage,
 };
-use std::time::Duration;
+use rmcp::transport::Transport;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-/// Generates a random UUID for request IDs
 pub(crate) fn generate_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-/// Sends a disconnected error response
 pub(crate) async fn reply_disconnected(id: &RequestId, stdout_sink: &mut StdoutSink) -> Result<()> {
     let error_response = ServerJsonRpcMessage::error(
         ErrorData::new(
@@ -34,80 +32,33 @@ pub(crate) async fn reply_disconnected(id: &RequestId, stdout_sink: &mut StdoutS
     Ok(())
 }
 
-pub(crate) async fn connect(app_state: &AppState) -> Result<SseClientType> {
-    // this function should try sending a POST request to the sse_url and see if
-    // the server responds with 405 method not supported. If so, it should call
-    // connect_with_sse, otherwise it should call connect_with_streamable.
-    let result = reqwest::Client::new()
-        .post(app_state.url.clone())
-        .header("Accept", "application/json,text/event-stream")
-        .header("Content-Type", "application/json")
-        .body(r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}}}"#)
-        .send()
-        .await?;
+pub(crate) async fn connect(app_state: &AppState) -> Result<McpTransport> {
+    let mut config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(app_state.url.clone());
+    config.retry_config = std::sync::Arc::new(NeverRetrySse);
+    config.channel_buffer_capacity = 16;
+    config.allow_stateless = true;
+    config.reinit_on_expired_session = false;
 
-    if result.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-        debug!("Server responded with 405, using SSE transport");
-        return connect_with_sse(app_state).await;
-    } else if result.status().is_success() {
-        debug!("Server responded successfully, using streamable transport");
-        return connect_with_streamable(app_state).await;
-    } else {
-        error!("Server returned unexpected status: {}", result.status());
-        anyhow::bail!("Server returned unexpected status: {}", result.status());
+    Ok(rmcp::transport::StreamableHttpClientTransport::with_client(
+        reqwest::Client::default(),
+        config,
+    ))
+}
+
+/// Custom retry policy that never retries SSE connections.
+/// We handle reconnection ourselves in the proxy logic.
+#[derive(Debug, Clone, Copy)]
+struct NeverRetrySse;
+
+impl rmcp::transport::common::client_side_sse::SseRetryPolicy for NeverRetrySse {
+    fn retry(&self, _current_times: usize) -> Option<std::time::Duration> {
+        None
     }
 }
 
-pub(crate) async fn connect_with_streamable(app_state: &AppState) -> Result<SseClientType> {
-    let result = rmcp::transport::StreamableHttpClientTransport::with_client(
-        reqwest::Client::default(),
-        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig {
-            uri: app_state.url.clone().into(),
-            // we don't want the sdk to perform any retries
-            retry_config: std::sync::Arc::new(rmcp::transport::common::client_side_sse::NeverRetry),
-            auth_header: None,
-            channel_buffer_capacity: 16,
-            allow_stateless: true,
-        },
-    );
-
-    Ok(SseClientType::Streamable(result))
-}
-
-pub(crate) async fn connect_with_sse(app_state: &AppState) -> Result<SseClientType> {
-    let result = rmcp::transport::SseClientTransport::start_with_client(
-        reqwest::Client::default(),
-        rmcp::transport::sse_client::SseClientConfig {
-            sse_endpoint: app_state.url.clone().into(),
-            // we don't want the sdk to perform any retries
-            retry_policy: std::sync::Arc::new(
-                rmcp::transport::common::client_side_sse::FixedInterval {
-                    max_times: Some(0),
-                    duration: Duration::from_millis(0),
-                },
-            ),
-            use_message_endpoint: None,
-        },
-    )
-    .await;
-
-    match result {
-        Ok(transport) => {
-            info!("Successfully reconnected to SSE server");
-            Ok(SseClientType::Sse(transport))
-        }
-        Err(e) => {
-            error!("Failed to reconnect: {}", e);
-            Err(anyhow!("Connection failed: {}", e))
-        }
-    }
-}
-
-/// Attempts to reconnect to the SSE server with backoff.
-/// Does not mutate AppState directly.
 pub(crate) async fn try_reconnect(
     app_state: &AppState,
-) -> Result<SseClientType, ReconnectFailureReason> {
+) -> Result<McpTransport, ReconnectFailureReason> {
     let backoff = app_state.get_backoff_duration();
     info!(
         "Attempting to reconnect in {}s (attempt {})",
@@ -124,7 +75,7 @@ pub(crate) async fn try_reconnect(
 
     match result {
         Ok(transport) => {
-            info!("Successfully reconnected to SSE server");
+            info!("Successfully reconnected to server");
             Ok(transport)
         }
         Err(e) => {
@@ -134,20 +85,18 @@ pub(crate) async fn try_reconnect(
     }
 }
 
-/// Sends a JSON-RPC request to the SSE server and handles any transport errors.
-/// Returns true if the send was successful, false otherwise.
-pub(crate) async fn send_request_to_sse(
-    transport: &mut SseClientType,
+pub(crate) async fn send_request_to_server(
+    transport: &mut McpTransport,
     request: ClientJsonRpcMessage,
     original_message: ClientJsonRpcMessage,
     stdout_sink: &mut StdoutSink,
     app_state: &mut AppState,
 ) -> Result<bool> {
-    debug!("Sending request to SSE: {:?}", request);
+    debug!("Sending request to server: {:?}", request);
     match transport.send(request.clone()).await {
         Ok(_) => Ok(true),
         Err(e) => {
-            error!("Error sending to SSE: {}", e);
+            error!("Error sending to server: {}", e);
             app_state.handle_fatal_transport_error();
             app_state
                 .maybe_handle_message_while_disconnected(original_message, stdout_sink)
@@ -158,22 +107,17 @@ pub(crate) async fn send_request_to_sse(
     }
 }
 
-/// Processes a client request message, handles ID mapping, sends it to the SSE server,
-/// and handles any transport errors.
 pub(crate) async fn process_client_request(
     message: ClientJsonRpcMessage,
     app_state: &mut AppState,
-    transport: &mut SseClientType,
+    transport: &mut McpTransport,
     stdout_sink: &mut StdoutSink,
 ) -> Result<()> {
-    // Try mapping the ID first (for Response/Error cases).
-    // If it returns None, the ID was unknown, so we skip processing/forwarding.
     let message = match app_state.map_client_response_error_id(message) {
         Some(msg) => msg,
-        None => return Ok(()), // Skip forwarding if ID was not mapped
+        None => return Ok(()),
     };
 
-    // Handle ping directly if disconnected
     match app_state
         .maybe_handle_message_while_disconnected(message.clone(), stdout_sink)
         .await
@@ -205,19 +149,18 @@ pub(crate) async fn process_client_request(
         _ => {}
     }
 
-    // Process requests separately to map their IDs before sending
     let original_message = message.clone();
     if let ClientJsonRpcMessage::Request(req) = message {
         let request_id = req.id.clone();
         let mut req = req.clone();
-        debug!("Forwarding request from stdin to SSE: {:?}", req);
+        debug!("Forwarding request from stdin to server: {:?}", req);
 
         let new_id = generate_id();
         let new_request_id = RequestId::String(new_id.clone().into());
         req.id = new_request_id;
         app_state.id_map.insert(new_id, request_id.clone());
 
-        let _success = send_request_to_sse(
+        let _success = send_request_to_server(
             transport,
             ClientJsonRpcMessage::Request(req),
             original_message,
@@ -228,20 +171,18 @@ pub(crate) async fn process_client_request(
         return Ok(());
     }
 
-    // Send other message types (Notifications, mapped Responses/Errors)
-    debug!("Forwarding message from stdin to SSE: {:?}", message);
+    debug!("Forwarding message from stdin to server: {:?}", message);
     if let Err(e) = transport.send(message).await {
-        error!("Error sending message to SSE: {}", e);
+        error!("Error sending message to server: {}", e);
         app_state.handle_fatal_transport_error();
     }
 
     Ok(())
 }
 
-/// Process buffered messages after a successful reconnection
 pub(crate) async fn process_buffered_messages(
     app_state: &mut AppState,
-    transport: &mut SseClientType,
+    transport: &mut McpTransport,
     stdout_sink: &mut StdoutSink,
 ) -> Result<()> {
     let buffered_messages = std::mem::take(&mut app_state.in_buf);
@@ -273,11 +214,8 @@ pub(crate) async fn process_buffered_messages(
                 }
             }
             _ => {
-                // Notifications etc.
                 if let Err(e) = transport.send(message.clone()).await {
                     error!("Error sending buffered message: {}", e);
-                    // If sending a buffered notification fails, we probably just log it.
-                    // Triggering another disconnect cycle might be excessive.
                 }
             }
         }
@@ -285,7 +223,6 @@ pub(crate) async fn process_buffered_messages(
     Ok(())
 }
 
-/// Sends error responses for all buffered messages
 pub(crate) async fn flush_buffer_with_errors(
     app_state: &mut AppState,
     stdout_sink: &mut StdoutSink,
@@ -313,13 +250,9 @@ pub(crate) async fn flush_buffer_with_errors(
     Ok(())
 }
 
-/// Initiates the post-reconnection handshake by sending the initialize request.
-/// Sets the state to WaitingForServerInitHidden.
-/// Returns Ok(true) if handshake initiated successfully (or not needed).
-/// Returns Ok(false) if sending the init message failed (triggers disconnect).
 pub(crate) async fn initiate_post_reconnect_handshake(
     app_state: &mut AppState,
-    transport: &mut SseClientType,
+    transport: &mut McpTransport,
     stdout_sink: &mut StdoutSink,
 ) -> Result<bool> {
     if let Some(init_msg) = &app_state.init_message {
@@ -346,25 +279,21 @@ pub(crate) async fn initiate_post_reconnect_handshake(
             Ok(true)
         }
     } else {
-        // If the init_message is None during a reconnect attempt, it's a fatal error.
         error!(
             "No initialization message stored. Cannot reconnect! This indicates a critical state issue."
         );
-        // Return an Err to signal a fatal condition that should terminate the proxy.
         Err(anyhow::anyhow!(
             "Cannot perform reconnect handshake: init_message is missing"
         ))
     }
 }
 
-/// Send a heartbeat ping to check if the transport is still connected.
-/// Returns Some(true) if alive, Some(false) if dead, None if check not needed.
 pub(crate) async fn send_heartbeat_if_needed(
     app_state: &AppState,
-    transport: &mut SseClientType,
+    transport: &mut McpTransport,
 ) -> Option<bool> {
-    if app_state.last_heartbeat.elapsed() > Duration::from_secs(5) {
-        debug!("Checking SSE connection state due to inactivity...");
+    if app_state.last_heartbeat.elapsed() > std::time::Duration::from_secs(5) {
+        debug!("Checking connection state due to inactivity...");
         match transport.receive().now_or_never() {
             Some(Some(_)) => {
                 debug!("Heartbeat check: Received message/event, connection alive.");
@@ -376,7 +305,7 @@ pub(crate) async fn send_heartbeat_if_needed(
             }
             None => {
                 debug!(
-                    "Heartbeat check: No immediate message/event, state uncertain but assuming alive for now."
+                    "Heartbeat check: No immediate message/event, assuming alive."
                 );
                 Some(true)
             }
