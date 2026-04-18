@@ -2,7 +2,7 @@ mod echo;
 use anyhow::Result;
 use rmcp::{
     ServiceExt,
-    model::CallToolRequestParam,
+    model::CallToolRequestParams,
     object,
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
@@ -103,22 +103,17 @@ fn collect_stderr(
     stderr_buffer
 }
 
-// Creates a new SSE server for testing
-// Starts the echo-server as a subprocess
-async fn create_sse_server(
-    server_name: &str,
+// Creates a new Streamable HTTP server for testing
+// Starts the echo_streamable server as a subprocess
+async fn create_server(
     address: SocketAddr,
 ) -> Result<(tokio::process::Child, String)> {
-    let url = if server_name == "echo_streamable" {
-        format!("http://{}/mcp", address)
-    } else {
-        format!("http://{}/sse", address)
-    };
+    let url = format!("http://{}/mcp", address);
 
     tracing::info!("Starting echo-server at {}", url);
 
     // Create echo-server process
-    let mut cmd = tokio::process::Command::new(format!("./target/debug/examples/{}", server_name));
+    let mut cmd = tokio::process::Command::new("./target/debug/examples/echo_streamable");
     cmd.arg("--address").arg(address.to_string());
 
     tracing::debug!("cmd: {:?}", cmd);
@@ -131,14 +126,14 @@ async fn create_sse_server(
 
     // Give the server time to start up
     sleep(Duration::from_millis(500)).await;
-    tracing::info!("{} server started successfully", server_name);
+    tracing::info!("echo_streamable server started successfully");
 
     Ok((child, url))
 }
 
-async fn protocol_initialization(server_name: &str) -> Result<()> {
+async fn protocol_initialization() -> Result<()> {
     const BIND_ADDRESS: &str = "127.0.0.1:8181";
-    let (server_handle, server_url) = create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+    let (server_handle, server_url) = create_server(BIND_ADDRESS.parse()?).await?;
 
     // Create a child process for the proxy with stderr capture
     let (child, mut reader, stderr_reader, mut stdin) = spawn_proxy(&server_url, vec![]).await?;
@@ -181,13 +176,12 @@ async fn protocol_initialization(server_name: &str) -> Result<()> {
 
 #[tokio::test]
 async fn test_protocol_initialization() -> Result<()> {
-    protocol_initialization("echo").await?;
-    protocol_initialization("echo_streamable").await?;
+    protocol_initialization().await?;
 
     Ok(())
 }
 
-async fn reconnection_handling(server_name: &str) -> Result<()> {
+async fn reconnection_handling() -> Result<()> {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()
@@ -196,9 +190,9 @@ async fn reconnection_handling(server_name: &str) -> Result<()> {
 
     const BIND_ADDRESS: &str = "127.0.0.1:8182";
 
-    // Start the SSE server
-    tracing::info!("Test: Starting initial SSE server");
-    let (server_handle, server_url) = create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+    // Start the server
+    tracing::info!("Test: Starting initial server");
+    let (server_handle, server_url) = create_server(BIND_ADDRESS.parse()?).await?;
 
     // Create a child process for the proxy
     tracing::info!("Test: Creating proxy process");
@@ -241,9 +235,9 @@ async fn reconnection_handling(server_name: &str) -> Result<()> {
     sleep(Duration::from_millis(1000)).await;
 
     // Create a new server on the same address
-    tracing::info!("Test: Starting new SSE server");
+    tracing::info!("Test: Starting new server");
     let (new_server_handle, new_url) =
-        create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+        create_server(BIND_ADDRESS.parse()?).await?;
     assert_eq!(
         server_url, new_url,
         "New server URL should match the original"
@@ -277,17 +271,16 @@ async fn reconnection_handling(server_name: &str) -> Result<()> {
 
 #[tokio::test]
 async fn test_reconnection_handling() -> Result<()> {
-    reconnection_handling("echo").await?;
-    reconnection_handling("echo_streamable").await?;
+    reconnection_handling().await?;
 
     Ok(())
 }
 
-async fn server_info_and_capabilities(server_name: &str) -> Result<()> {
+async fn server_info_and_capabilities() -> Result<()> {
     const BIND_ADDRESS: &str = "127.0.0.1:8183";
-    // Start the SSE server
+    // Start the server
     let (mut server_handle, server_url) =
-        create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+        create_server(BIND_ADDRESS.parse()?).await?;
 
     // Create a transport for the proxy
     let transport = TokioChildProcess::new(
@@ -308,12 +301,10 @@ async fn server_info_and_capabilities(server_name: &str) -> Result<()> {
     // Call the echo tool with a test message
     if let Some(echo_tool) = tools.iter().find(|t| t.name.contains("echo")) {
         let result = client
-            .call_tool(CallToolRequestParam {
-                name: echo_tool.name.clone(),
-                arguments: Some(object!({
+            .call_tool(CallToolRequestParams::new(echo_tool.name.clone())
+                .with_arguments(object!({
                     "message": "Testing server capabilities"
-                })),
-            })
+                })))
             .await?;
 
         // Verify the response
@@ -332,13 +323,12 @@ async fn server_info_and_capabilities(server_name: &str) -> Result<()> {
 
 #[tokio::test]
 async fn test_server_info_and_capabilities() -> Result<()> {
-    server_info_and_capabilities("echo").await?;
-    server_info_and_capabilities("echo_streamable").await?;
+    server_info_and_capabilities().await?;
 
     Ok(())
 }
 
-async fn initial_connection_retry(server_name: &str) -> Result<()> {
+async fn initial_connection_retry() -> Result<()> {
     // Set up custom logger for this test to clearly see what's happening
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -347,11 +337,7 @@ async fn initial_connection_retry(server_name: &str) -> Result<()> {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     const BIND_ADDRESS: &str = "127.0.0.1:8184";
-    let server_url = if server_name == "echo_streamable" {
-        format!("http://{}/mcp", BIND_ADDRESS)
-    } else {
-        format!("http://{}/sse", BIND_ADDRESS)
-    };
+    let server_url = format!("http://{}/mcp", BIND_ADDRESS);
     let bind_addr: SocketAddr = BIND_ADDRESS.parse()?;
 
     // 1. Start the proxy process BEFORE the server
@@ -377,9 +363,9 @@ async fn initial_connection_retry(server_name: &str) -> Result<()> {
     stdin.write_all(init_message.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
 
-    // 3. Start the SSE server AFTER the wait and AFTER sending init
-    tracing::info!("Test: Starting SSE server on {}", BIND_ADDRESS);
-    let (server_handle, returned_url) = create_sse_server(server_name, bind_addr).await?;
+    // 3. Start the server AFTER the wait and AFTER sending init
+    tracing::info!("Test: Starting server on {}", BIND_ADDRESS);
+    let (server_handle, returned_url) = create_server(bind_addr).await?;
     assert_eq!(server_url, returned_url, "Server URL mismatch");
 
     let _test_guard = TestGuard::new(child, server_handle, stderr_buffer);
@@ -447,13 +433,12 @@ async fn initial_connection_retry(server_name: &str) -> Result<()> {
 
 #[tokio::test]
 async fn test_initial_connection_retry() -> Result<()> {
-    initial_connection_retry("echo").await?;
-    initial_connection_retry("echo_streamable").await?;
+    initial_connection_retry().await?;
 
     Ok(())
 }
 
-async fn ping_when_disconnected(server_name: &str) -> Result<()> {
+async fn ping_when_disconnected() -> Result<()> {
     const BIND_ADDRESS: &str = "127.0.0.1:8185";
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -461,9 +446,9 @@ async fn ping_when_disconnected(server_name: &str) -> Result<()> {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    // 1. Start the SSE server
-    tracing::info!("Test: Starting SSE server for ping test");
-    let (server_handle, server_url) = create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+    // 1. Start the server
+    tracing::info!("Test: Starting server for ping test");
+    let (server_handle, server_url) = create_server(BIND_ADDRESS.parse()?).await?;
 
     // Create a child process for the proxy
     tracing::info!("Test: Creating proxy process");
@@ -502,8 +487,8 @@ async fn ping_when_disconnected(server_name: &str) -> Result<()> {
     // Allow time for proxy to process initialized and potentially send buffered msgs (if any)
     sleep(Duration::from_millis(100)).await;
 
-    // 3. Kills the SSE server
-    tracing::info!("Test: Shutting down SSE server");
+    // 3. Kills the server
+    tracing::info!("Test: Shutting down server");
     if let Some(mut server) = test_guard.server_handle.take() {
         server.kill().await?;
     }
@@ -540,19 +525,18 @@ async fn ping_when_disconnected(server_name: &str) -> Result<()> {
 
 #[tokio::test]
 async fn test_ping_when_disconnected() -> Result<()> {
-    ping_when_disconnected("echo").await?;
-    ping_when_disconnected("echo_streamable").await?;
+    ping_when_disconnected().await?;
 
     Ok(())
 }
 
-async fn protocol_version_override(server_name: &str) -> Result<()> {
+async fn protocol_version_override() -> Result<()> {
     const BIND_ADDRESS: &str = "127.0.0.1:8186";
 
     // Phase 1: Test normal behavior (no override)
     {
         let (server_handle, server_url) =
-            create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+            create_server(BIND_ADDRESS.parse()?).await?;
         let (child, mut reader, stderr_reader, mut stdin) =
             spawn_proxy(&server_url, vec![]).await?;
         let stderr_buffer = collect_stderr(stderr_reader);
@@ -589,7 +573,7 @@ async fn protocol_version_override(server_name: &str) -> Result<()> {
     // Phase 2: Test with protocol version override
     {
         let (server_handle, server_url) =
-            create_sse_server(server_name, BIND_ADDRESS.parse()?).await?;
+            create_server(BIND_ADDRESS.parse()?).await?;
         let (child, mut reader, stderr_reader, mut stdin) = spawn_proxy(
             &server_url,
             vec!["--override-protocol-version", "2024-11-05"],
@@ -635,8 +619,7 @@ async fn protocol_version_override(server_name: &str) -> Result<()> {
 
 #[tokio::test]
 async fn test_protocol_version_override() -> Result<()> {
-    protocol_version_override("echo").await?;
-    protocol_version_override("echo_streamable").await?;
+    protocol_version_override().await?;
 
     Ok(())
 }
