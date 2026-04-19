@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 (2026-04-19)
+
+* Breaking changes
+  * Remove SSE-only transport support (2024-11-05 protocol) — all connections now use Streamable HTTP
+  * Remove vendored `openssl-sys` dependency (now uses rustls via reqwest)
+* Enhancements
+  * Upgrade `rmcp` from stale fork to upstream v1.5.0 (crates.io)
+  * Upgrade `reqwest` from 0.12 to 0.13
+  * Add protocol versions `2025-06-18` and `2025-11-25` to `--override-protocol-version`
+  * Add elicitation support (MCP spec 2025-06-18) — proxy forwards `elicitation/create` server-to-client requests
+* Tests
+  * Add elicitation roundtrip smoke test
+  * Migrate existing tests from SSE to Streamable HTTP
+
 ## 0.2.3 (2025-10-15)
 
 * Bug fixes
