@@ -1,13 +1,12 @@
 # mcp-proxy
 
-A standalone binary for connecting STDIO based MCP clients to HTTP (SSE) based MCP servers.
+> **Note:** This is a community fork of [tidewave-ai/mcp_proxy_rust](https://github.com/tidewave-ai/mcp_proxy_rust), which is no longer actively maintained upstream.
 
-Note: the proxy supports both SSE according to the `2024-11-05` as well as streamable HTTP according to the `2025-03-26` specification.
-It may happen though that the connecting client does **not** support the version sent by the server.
+A standalone binary for connecting STDIO based MCP clients to HTTP based MCP servers using the Streamable HTTP transport (`2025-03-26` specification and later).
 
 ## Installation
 
-The latest releases are available on the [releases page](https://github.com/tidewave-ai/mcp_proxy_rust/releases).
+The latest releases are available on the [releases page](https://github.com/leobessa/mcp_proxy_rust/releases).
 
 ### macOS
 
@@ -16,13 +15,13 @@ Depending on your Mac, you can download the latest version with one of the follo
 Apple Silicon:
 
 ```bash
-curl -sL https://github.com/tidewave-ai/mcp_proxy_rust/releases/latest/download/mcp-proxy-aarch64-apple-darwin.tar.gz | tar xv
+curl -sL https://github.com/leobessa/mcp_proxy_rust/releases/latest/download/mcp-proxy-aarch64-apple-darwin.tar.gz | tar xv
 ```
 
 Intel:
 
 ```bash
-curl -sL https://github.com/tidewave-ai/mcp_proxy_rust/releases/latest/download/mcp-proxy-x86_64-apple-darwin.tar.gz | tar xv
+curl -sL https://github.com/leobessa/mcp_proxy_rust/releases/latest/download/mcp-proxy-x86_64-apple-darwin.tar.gz | tar xv
 ```
 
 which will put the `mcp-proxy` binary in the current working directory (`pwd`).
@@ -37,31 +36,37 @@ xattr -d com.apple.quarantine /path/to/mcp-proxy
 
 ### Linux
 
-You can download the latest release from the [Releases page](https://github.com/tidewave-ai/mcp_proxy_rust/releases) or with one command, depending on your architecture:
+You can download the latest release from the [Releases page](https://github.com/leobessa/mcp_proxy_rust/releases) or with one command, depending on your architecture:
 
 x86:
 
 ```bash
-curl -sL https://github.com/tidewave-ai/mcp_proxy_rust/releases/latest/download/mcp-proxy-x86_64-unknown-linux-musl.tar.gz | tar zxv
+curl -sL https://github.com/leobessa/mcp_proxy_rust/releases/latest/download/mcp-proxy-x86_64-unknown-linux-musl.tar.gz | tar zxv
 ```
 
 arm64 / aarch64:
 
 ```bash
-curl -sL https://github.com/tidewave-ai/mcp_proxy_rust/releases/latest/download/mcp-proxy-aarch64-unknown-linux-musl.tar.gz | tar zxv
+curl -sL https://github.com/leobessa/mcp_proxy_rust/releases/latest/download/mcp-proxy-aarch64-unknown-linux-musl.tar.gz | tar zxv
 ```
 
 ### Windows
 
-You can download the latest release from the [Releases page](https://github.com/tidewave-ai/mcp_proxy_rust/releases) or with the following Powershell command:
+You can download the latest release from the [Releases page](https://github.com/leobessa/mcp_proxy_rust/releases) or with the following Powershell command:
 
 ```powershell
-curl.exe -L -o mcp-proxy.zip https://github.com/tidewave-ai/mcp_proxy_rust/releases/latest/download/mcp-proxy-x86_64-pc-windows-msvc.zip; Expand-Archive -Path mcp-proxy.zip -DestinationPath .
+curl.exe -L -o mcp-proxy.zip https://github.com/leobessa/mcp_proxy_rust/releases/latest/download/mcp-proxy-x86_64-pc-windows-msvc.zip; Expand-Archive -Path mcp-proxy.zip -DestinationPath .
 ```
 
-## Building from scratch
+## Install from source
 
-The proxy is built in Rust. If you have Rust and its tools installed, the project can be built with `cargo`:
+If you have Rust and its tools installed:
+
+```bash
+cargo install --git https://github.com/leobessa/mcp_proxy_rust
+```
+
+Or build manually:
 
 ```bash
 cargo build --release
