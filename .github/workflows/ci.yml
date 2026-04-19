@@ -16,6 +16,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      run: rustup show
     - name: Build
       run: cargo build --verbose
     - name: Build examples

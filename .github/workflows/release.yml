@@ -60,6 +60,7 @@ jobs:
         with:
           command: build
           target: ${{ matrix.platform.target }}
+          toolchain: "1.88"
           args: "--locked --release"
           strip: true
       - name: Create archive (Unix)
