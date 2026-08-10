@@ -1,11 +1,12 @@
+use crate::http_client::TolerantHttpClient;
 use crate::state::{AppState, BufferMode, ProxyState, ReconnectFailureReason};
 use crate::{DISCONNECTED_ERROR_CODE, McpTransport, StdoutSink, TRANSPORT_SEND_ERROR_CODE};
 use anyhow::Result;
 use futures::FutureExt;
 use futures::SinkExt;
 use rmcp::model::{
-    ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, RequestId,
-    ServerJsonRpcMessage,
+    ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, InitializedNotification,
+    InitializedNotificationMethod, RequestId, ServerJsonRpcMessage,
 };
 use rmcp::transport::Transport;
 use tracing::{debug, error, info};
@@ -36,12 +37,24 @@ pub(crate) async fn connect(app_state: &AppState) -> Result<McpTransport> {
     let mut config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(app_state.url.clone());
     config.retry_config = std::sync::Arc::new(NeverRetrySse);
     config.channel_buffer_capacity = 16;
+    // Stateless servers never issue a session id and have no SSE channel; both
+    // must be optional rather than required.
     config.allow_stateless = true;
     config.reinit_on_expired_session = false;
 
     Ok(rmcp::transport::StreamableHttpClientTransport::with_client(
-        reqwest::Client::default(),
+        TolerantHttpClient::new(),
         config,
+    ))
+}
+
+/// The `notifications/initialized` message that completes an MCP handshake.
+pub(crate) fn initialized_notification() -> ClientJsonRpcMessage {
+    ClientJsonRpcMessage::notification(ClientNotification::InitializedNotification(
+        InitializedNotification {
+            method: InitializedNotificationMethod,
+            extensions: rmcp::model::Extensions::default(),
+        },
     ))
 }
 
@@ -138,12 +151,13 @@ pub(crate) async fn process_client_request(
         }
         ClientJsonRpcMessage::Notification(notification) => {
             if let ClientNotification::InitializedNotification(_) = notification.notification {
-                if app_state.state == ProxyState::WaitingForClientInitialized {
-                    debug!("Received client initialized notification, proxy fully connected.");
-                    app_state.connected();
-                } else {
-                    debug!("Forwarding client initialized notification outside of expected state.");
-                }
+                // The proxy owns this notification: it sends its own as soon as
+                // the server's initialize response arrives, because the
+                // transport will not carry any other request until it has (see
+                // `AppState::complete_handshake`). Forwarding the client's copy
+                // too would duplicate it, so absorb it here.
+                debug!("Absorbing client initialized notification; handshake already completed.");
+                return Ok(());
             }
         }
         _ => {}
