@@ -45,8 +45,10 @@ pub enum NotificationReply {
 pub struct StatelessServer {
     notification_reply: NotificationReply,
     abort_tools_call: bool,
+    collide_ids_on_tools_call: bool,
     post_count: Arc<AtomicUsize>,
     get_count: Arc<AtomicUsize>,
+    client_responses: Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
 impl StatelessServer {
@@ -54,9 +56,26 @@ impl StatelessServer {
         Self {
             notification_reply,
             abort_tools_call: false,
+            collide_ids_on_tools_call: false,
             post_count: Arc::new(AtomicUsize::new(0)),
             get_count: Arc::new(AtomicUsize::new(0)),
+            client_responses: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Answers `tools/call` with an SSE stream that first sends a
+    /// *server-initiated* request reusing the client's own request id, then the
+    /// response to that request under the same id. The two ids travel in
+    /// opposite directions, so nothing about this is ambiguous -- but it is
+    /// exactly the collision the proxy's id rewriting was said to prevent.
+    pub fn colliding_ids_on_tools_call(mut self) -> Self {
+        self.collide_ids_on_tools_call = true;
+        self
+    }
+
+    /// JSON-RPC responses the *client* sent back to the server.
+    pub fn client_responses(&self) -> Vec<Value> {
+        self.client_responses.lock().unwrap().clone()
     }
 
     /// Answers `tools/call` by sending response headers and then dropping the
@@ -126,6 +145,17 @@ async fn handle(
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let id = message.get("id").cloned();
 
+    // A message with an id but no method is the client answering a
+    // server-initiated request.
+    if id.is_some() && message.get("method").is_none() {
+        server
+            .client_responses
+            .lock()
+            .unwrap()
+            .push(message.clone());
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     // A notification has no id, so there is nothing to respond with.
     let Some(id) = id else {
         return match server.notification_reply {
@@ -153,6 +183,25 @@ async fn handle(
             }
         };
     };
+
+    if method == "tools/call" && server.collide_ids_on_tools_call {
+        // Deliberately reuse the client's request id for a server-initiated
+        // request, then answer the original request under that same id.
+        let server_request = json!({"jsonrpc": "2.0", "id": id, "method": "ping"});
+        let answer = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": "done"}], "isError": false},
+        });
+        let stream =
+            format!("event: message\ndata: {server_request}\n\nevent: message\ndata: {answer}\n\n");
+        let mut response = Response::new(Body::from(stream));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return response;
+    }
 
     if method == "tools/call" && server.abort_tools_call {
         let aborting = futures::stream::once(async {

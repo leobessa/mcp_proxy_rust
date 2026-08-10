@@ -10,10 +10,11 @@
   * Answer a request the server refuses instead of tearing the session down. Previously *any* failure to send was treated as the connection dying: the proxy disconnected, buffered the request, reconnected and replayed it, so the client heard nothing until that finished and was then told `Transport error` — blaming the transport for what was one bad call. Unrelated requests in flight at the time were swept into the buffer with it. A server that is genuinely unreachable still buffers and reconnects as before.
   * Report the underlying cause of a transport failure. Every HTTP-level failure renders identically as `error sending request for url (...)`, whether the server was unreachable, hung up mid-response, or spoke nonsense; the cause that distinguishes them lives further down the error's `source()` chain and was being discarded.
   * Stop treating an unreadable response body as an empty one. A truncated response was reported as "nothing to say", silently stranding the request waiting on it.
-  * Drop the id mapping for a request that was never delivered, instead of leaking it.
+  * Forward JSON-RPC ids untouched. The proxy used to rewrite every request id to a generated UUID and keep a map back to the original. That map was the only reason an id could ever be *unknown*, and an unknown id meant the message was dropped with nothing but a warning — silently losing a real response whenever the mapping had been cleared by a reconnect or a buffer flush. The duplicate it guarded against cannot occur: a request id is scoped to the direction the request travels, so a client id and a server id never compete. Removing it deletes the map, both mapping functions, the leak, and the `uuid` dependency.
 * Tests
   * Add regression coverage for stateless plain-JSON servers across five notification-response shapes, for clients that skip `notifications/initialized`, and for the false-green `initialize`.
   * Add coverage for a server that refuses one request: it must be answered by id, name the failing method, carry the underlying cause, and leave the session intact.
+  * Add coverage for a server-initiated request that deliberately reuses the client's own request id, in both directions.
 * Known issues
   * Against Tidewave 0.8.1, `initialize` and `tools/list` work but `tools/call` still fails. The root cause is not yet known; the changes above should now report it accurately rather than as a `-32011` several steps removed from the fault.
 
