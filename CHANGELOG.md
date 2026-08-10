@@ -3,12 +3,14 @@
 ## Unreleased
 
 * Bug fixes
-  * Support stateless plain-JSON MCP servers — ones that answer every POST inline, never issue an `mcp-session-id`, and return 405 for `GET`. Response bodies are now what identify a message; an unrecognised or missing `content-type` no longer kills the transport and leaves the request unanswered forever.
+  * Stop losing requests against stateless plain-JSON MCP servers — ones that answer every POST inline, never issue an `mcp-session-id`, and return 405 for `GET`. Response bodies are now what identify a message; an unrecognised or missing `content-type` no longer kills the transport and leaves the request unanswered forever.
   * Complete the MCP handshake from the proxy instead of relying on the client's `notifications/initialized` arriving as the very next message. A client that skips it previously had its first request silently consumed and never answered.
   * Report a failed handshake as a failed `initialize`. Previously the proxy answered `initialize` successfully and only failed on the first tool call, so clients that merely handshake (`claude mcp list`) reported a healthy connection to a server that could not serve them.
   * Treat an unavailable server-to-client SSE channel as a missing capability rather than a transport failure.
 * Tests
   * Add regression coverage for stateless plain-JSON servers across five notification-response shapes, for clients that skip `notifications/initialized`, and for the false-green `initialize`.
+* Known issues
+  * Against Tidewave 0.8.1, `initialize` and `tools/list` now work but `tools/call` still fails with `-32011`. The POST fails at the HTTP level on a freshly established connection, so it is not covered by the fixes above and is still being diagnosed.
 
 ## 0.3.0 (2026-04-19)
 

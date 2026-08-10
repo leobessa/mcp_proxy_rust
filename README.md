@@ -121,6 +121,6 @@ Streamable HTTP gives servers a lot of latitude, and `mcp-proxy` aims to work wi
 * **No server-to-client channel.** If `GET` on the endpoint returns 405 (or anything else unusable), the proxy carries on with a POST-only session instead of treating it as a connection failure.
 * **Plain JSON replies.** Every POST may be answered inline. The proxy identifies a response by parsing its body, so an unexpected or absent `content-type` does not lose the message, and a JSON-RPC error delivered with a non-2xx status is passed through to the client as an error rather than as a transport failure.
 
-Between them these cover a fully stateless plain-JSON JSON-RPC endpoint, which is the smallest thing that can call itself an MCP server.
+Between them these cover a fully stateless plain-JSON JSON-RPC endpoint, which is the smallest thing that can call itself an MCP server. Note that [Tidewave](https://hexdocs.pm/tidewave) 0.8.1 is not yet fully supported: `initialize` and `tools/list` work, but `tools/call` fails — see the CHANGELOG.
 
 If a connection genuinely cannot carry an MCP session, the proxy fails at `initialize` rather than reporting success and failing later — so a client that only performs the handshake will not show a broken server as connected.
