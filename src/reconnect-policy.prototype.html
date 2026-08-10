@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mcp-proxy — what should happen when one call fails?</title>
+<style>
+  :root {
+    --bg: #fbfaf9;
+    --panel: #ffffff;
+    --ink: #1b1a19;
+    --muted: #6b6764;
+    --line: #e5e1dd;
+    --accent: #b4531f;
+    --accent-soft: #fdf1ea;
+    --ok: #2f6b46;
+    --bad: #a3282c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 48px 24px 96px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1060px; margin: 0 auto; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  h3 { font-size: 17px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 68ch; }
+  .question {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 18px 22px;
+    margin: 28px 0 40px;
+    max-width: 78ch;
+  }
+  .question strong { color: var(--accent); }
+  .prototype-tag {
+    display: inline-block; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+    background: var(--ink); color: var(--bg); padding: 4px 9px; border-radius: 3px; margin-bottom: 18px;
+  }
+  section { margin-bottom: 44px; }
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 820px) { .columns { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 22px; }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+  .panel-sub { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+  .field { display: flex; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); font-size: 15px; }
+  .field:first-of-type { border-top: none; }
+  .field dt { color: var(--muted); flex: 0 0 116px; }
+  .field dd { margin: 0; flex: 1; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+  .pill.connected { background: #e7f2ec; color: var(--ok); }
+  .pill.reconnecting { background: #fdf1ea; color: var(--accent); }
+  .pill.gaveup { background: #f8eaea; color: var(--bad); }
+  .empty { color: var(--muted); font-style: italic; }
+  ul.plain { list-style: none; margin: 0; padding: 0; }
+  ul.plain li { padding: 2px 0; }
+  .delivered li { display: flex; gap: 8px; align-items: baseline; }
+  .tick { color: var(--ok); font-weight: 700; }
+  .cross { color: var(--bad); font-weight: 700; }
+  .errtext { color: var(--bad); }
+  .notes { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; font-size: 14px; color: var(--muted); min-height: 68px; }
+  .notes li { padding: 3px 0; }
+  .notes li::before { content: "→ "; color: var(--accent); }
+  button {
+    font: inherit; font-size: 14px; cursor: pointer;
+    background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 9px 14px; text-align: left;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button:disabled:hover { border-color: var(--line); color: var(--ink); }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 9px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; border-bottom: 1px solid var(--line); }
+  .tab {
+    border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    background: none; padding: 10px 14px; color: var(--muted); font-weight: 500;
+  }
+  .tab:hover { color: var(--accent); border-color: transparent; }
+  .tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .steps { display: flex; flex-direction: column; gap: 8px; margin-top: 18px; max-width: 620px; }
+  .step { display: flex; align-items: center; gap: 12px; }
+  .step-num { flex: 0 0 24px; height: 24px; border-radius: 50%; background: var(--line); color: var(--muted);
+              display: grid; place-items: center; font-size: 12px; font-weight: 700; }
+  .step.done .step-num { background: var(--ok); color: #fff; }
+  .step.next .step-num { background: var(--accent); color: #fff; }
+  .step button { flex: 1; }
+  .watch { background: var(--accent-soft); border-radius: 6px; padding: 14px 18px; margin-top: 6px; font-size: 15px; }
+  .watch strong { color: var(--accent); }
+  footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; background: #f2efec; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<main>
+  <span class="prototype-tag">Prototype — throwaway</span>
+  <h1>When one call fails, should the whole session go down?</h1>
+  <p class="lede">
+    A demo of how <code>mcp-proxy</code> reacts when the server refuses a single request.
+    Press the buttons and watch what the editor on the other end actually receives.
+  </p>
+
+  <div class="question">
+    <p><strong>The question this answers.</strong>
+    Right now the proxy treats <em>any</em> failure to send a request as the whole connection dying:
+    it tears the session down, hides the request in a buffer, reconnects, and replays it. That is
+    the correct thing to do when the server has genuinely gone away. It is the wrong thing to do
+    when just <em>one</em> call failed — the editor sits waiting, and eventually gets an error
+    blaming the transport for what was really one bad call.</p>
+    <p style="margin-bottom:0">So: <strong>should the proxy tell those two situations apart?</strong>
+    The two columns below run the same events through today's rule and through a proposed rule that
+    answers the failing call directly and leaves the connection alone. Scenario 3 is the one that
+    matters most — it checks the proposed rule doesn't break the case buffering exists for.</p>
+  </div>
+
+  <section>
+    <h2>What the editor sees</h2>
+    <div class="columns" id="columns"></div>
+  </section>
+
+  <section>
+    <h2>Free play — press anything, in any order</h2>
+    <div class="btn-row" id="freeplay"></div>
+  </section>
+
+  <section>
+    <h2>Guided walkthroughs</h2>
+    <div class="tabs" id="tabs" role="tablist"></div>
+    <div id="scenario"></div>
+  </section>
+
+  <footer>
+    Throwaway prototype for the <code>mcp-proxy</code> reconnect policy. The reducer in this file is
+    the part worth keeping; the page around it is not.
+  </footer>
+</main>
+
+<script>
+/* ------------------------------------------------------------------ *
+ * THE MODULE UNDER TEST — pure, no DOM. This is the bit that would
+ * lift into src/state.rs if the proposed policy holds up.
+ *
+ * A "call" is one JSON-RPC request travelling editor -> proxy -> server.
+ * `policy` is either 'current' (what mcp-proxy does today) or
+ * 'proposed' (answer the failing call, keep the connection).
+ * ------------------------------------------------------------------ */
+
+const INITIAL_STATE = {
+  link: 'connected',   // 'connected' | 'reconnecting' | 'gave-up'
+  inFlight: [],        // calls sent to the server, awaiting an answer
+  buffered: [],        // calls held back until the server returns
+  delivered: [],       // what the editor has actually received
+  notes: [],           // plain-language account of the last action
+};
+
+function reduce(state, action, policy) {
+  const s = {
+    link: state.link,
+    inFlight: state.inFlight.slice(),
+    buffered: state.buffered.slice(),
+    delivered: state.delivered.slice(),
+    notes: [],
+  };
+  const note = (t) => s.notes.push(t);
+  const take = (list, id) => {
+    const i = list.findIndex((c) => c.id === id);
+    return i === -1 ? null : list.splice(i, 1)[0];
+  };
+
+  switch (action.type) {
+    case 'RESET':
+      return { ...INITIAL_STATE, inFlight: [], buffered: [], delivered: [], notes: ['Starting fresh.'] };
+
+    case 'EDITOR_CALLS': {
+      const call = { id: action.id, method: action.method, replayed: false };
+      if (s.link === 'connected') {
+        s.inFlight.push(call);
+        note(`Editor asked for ${call.method}. Sent straight to the server.`);
+      } else if (s.link === 'reconnecting') {
+        s.buffered.push(call);
+        note(`Editor asked for ${call.method}, but we are mid-reconnect.`);
+        note(`Held in the buffer. The editor is now waiting with no answer.`);
+      } else {
+        s.delivered.push({ id: call.id, ok: false, text: `${call.method} — server not connected` });
+        note(`Editor asked for ${call.method}. Refused immediately; we already gave up.`);
+      }
+      return s;
+    }
+
+    case 'SERVER_ANSWERS': {
+      const call = take(s.inFlight, action.id);
+      if (!call) { note('Nothing is waiting on the server with that id.'); return s; }
+      s.delivered.push({ id: call.id, ok: true, text: `${call.method} — result` });
+      note(`Server answered ${call.method}. Passed back to the editor untouched.`);
+      return s;
+    }
+
+    case 'SERVER_REFUSES_ONE_CALL': {
+      const call = take(s.inFlight, action.id);
+      if (!call) { note('Nothing is waiting on the server with that id.'); return s; }
+
+      if (policy === 'proposed') {
+        s.delivered.push({ id: call.id, ok: false, text: `${call.method} — the server would not accept this call` });
+        note(`The POST for ${call.method} failed.`);
+        note(`Answered that one call with an error, naming the call that failed.`);
+        note(`Connection left alone. Everything else keeps working.`);
+        return s;
+      }
+
+      // policy === 'current'
+      if (call.replayed) {
+        // Faithful to process_buffered_messages: a replayed call that fails
+        // again is answered with a transport error, and the link is not torn
+        // down a second time.
+        s.delivered.push({ id: call.id, ok: false, text: `Transport error: error sending request` });
+        note(`The replayed ${call.method} failed again.`);
+        note(`Editor finally gets an answer — but it blames the transport, not the call.`);
+        return s;
+      }
+      s.link = 'reconnecting';
+      s.buffered.push(call, ...s.inFlight);
+      const alsoDropped = s.inFlight.length;
+      s.inFlight = [];
+      note(`The POST for ${call.method} failed.`);
+      note(`Treated as the whole connection dying. Session torn down.`);
+      note(alsoDropped
+        ? `${call.method} and ${alsoDropped} unrelated call(s) are now buffered, unanswered.`
+        : `${call.method} is now buffered, unanswered. The editor is still waiting.`);
+      return s;
+    }
+
+    case 'CONNECTION_DROPS': {
+      if (s.link !== 'connected') { note('The connection is already not up.'); return s; }
+      s.link = 'reconnecting';
+      const moved = s.inFlight.length;
+      s.buffered.push(...s.inFlight);
+      s.inFlight = [];
+      note(`The server connection dropped.`);
+      note(moved ? `${moved} call(s) in flight moved to the buffer to be retried.` : `Nothing was in flight.`);
+      return s;
+    }
+
+    case 'RECONNECT_SUCCEEDS': {
+      if (s.link !== 'reconnecting') { note('Only meaningful while reconnecting.'); return s; }
+      s.link = 'connected';
+      const replayed = s.buffered.map((c) => ({ ...c, replayed: true }));
+      s.buffered = [];
+      s.inFlight.push(...replayed);
+      note(`Reconnected and handshake completed.`);
+      note(replayed.length ? `Replayed ${replayed.length} buffered call(s) to the server.` : `Nothing was waiting to replay.`);
+      return s;
+    }
+
+    case 'GIVE_UP_TIMER': {
+      if (s.link !== 'reconnecting') { note('The give-up timer only runs while reconnecting.'); return s; }
+      s.link = 'gave-up';
+      for (const call of s.buffered) {
+        s.delivered.push({ id: call.id, ok: false, text: `${call.method} — server not connected` });
+      }
+      note(`Twenty seconds elapsed. Gave up reconnecting.`);
+      note(s.buffered.length
+        ? `Answered ${s.buffered.length} buffered call(s) with an error — after a 20 second wait.`
+        : `No buffered calls to answer.`);
+      s.buffered = [];
+      return s;
+    }
+  }
+  return s;
+}
+
+/* ------------------------------------------------------------------ *
+ * Throwaway page below this line.
+ * ------------------------------------------------------------------ */
+
+const POLICIES = [
+  { key: 'current',  title: 'Today',    sub: "Any send failure means the connection died." },
+  { key: 'proposed', title: 'Proposed', sub: "A refused call is answered; the connection stays up." },
+];
+
+let states = { current: INITIAL_STATE, proposed: INITIAL_STATE };
+
+function dispatch(action) {
+  states = {
+    current:  reduce(states.current,  action, 'current'),
+    proposed: reduce(states.proposed, action, 'proposed'),
+  };
+  render();
+}
+
+const linkLabel = { connected: 'Connected', reconnecting: 'Reconnecting', 'gave-up': 'Gave up' };
+const linkClass = { connected: 'connected', reconnecting: 'reconnecting', 'gave-up': 'gaveup' };
+
+function callList(calls) {
+  if (!calls.length) return '<span class="empty">none</span>';
+  return `<ul class="plain">${calls.map((c) =>
+    `<li>${c.method}${c.replayed ? ' <span class="empty">(replayed)</span>' : ''}</li>`).join('')}</ul>`;
+}
+
+function deliveredList(items) {
+  if (!items.length) return '<span class="empty">nothing yet — the editor is still waiting</span>';
+  return `<ul class="plain delivered">${items.map((d) =>
+    `<li><span class="${d.ok ? 'tick' : 'cross'}">${d.ok ? '✓' : '✕'}</span>` +
+    `<span class="${d.ok ? '' : 'errtext'}">${d.text}</span></li>`).join('')}</ul>`;
+}
+
+function render() {
+  document.getElementById('columns').innerHTML = POLICIES.map(({ key, title, sub }) => {
+    const s = states[key];
+    return `
+      <div class="panel">
+        <div class="panel-head">
+          <h3>${title}</h3>
+          <span class="pill ${linkClass[s.link]}">${linkLabel[s.link]}</span>
+        </div>
+        <div class="panel-sub">${sub}</div>
+        <dl style="margin:0">
+          <div class="field"><dt>Waiting on server</dt><dd>${callList(s.inFlight)}</dd></div>
+          <div class="field"><dt>Held in buffer</dt><dd>${callList(s.buffered)}</dd></div>
+          <div class="field"><dt>Editor received</dt><dd>${deliveredList(s.delivered)}</dd></div>
+        </dl>
+        <ul class="plain notes">${s.notes.map((n) => `<li>${n}</li>`).join('')}</ul>
+      </div>`;
+  }).join('');
+  renderScenario();
+}
+
+/* --- free play ---------------------------------------------------- */
+
+const FREE_PLAY = [
+  { label: 'Editor calls tools/list',        action: { type: 'EDITOR_CALLS', id: 'A', method: 'tools/list' } },
+  { label: 'Editor calls tools/call',        action: { type: 'EDITOR_CALLS', id: 'B', method: 'tools/call' } },
+  { label: 'Server answers tools/list',      action: { type: 'SERVER_ANSWERS', id: 'A' } },
+  { label: 'Server answers tools/call',      action: { type: 'SERVER_ANSWERS', id: 'B' } },
+  { label: 'Server refuses tools/call',      action: { type: 'SERVER_REFUSES_ONE_CALL', id: 'B' } },
+  { label: 'Connection drops',               action: { type: 'CONNECTION_DROPS' } },
+  { label: 'Reconnect succeeds',             action: { type: 'RECONNECT_SUCCEEDS' } },
+  { label: 'Give-up timer fires (20s)',      action: { type: 'GIVE_UP_TIMER' } },
+  { label: 'Start over',                     action: { type: 'RESET' } },
+];
+
+document.getElementById('freeplay').innerHTML = FREE_PLAY
+  .map((b, i) => `<button data-free="${i}">${b.label}</button>`).join('');
+document.getElementById('freeplay').addEventListener('click', (e) => {
+  const i = e.target.dataset.free;
+  if (i !== undefined) { activeStep = null; dispatch(FREE_PLAY[i].action); }
+});
+
+/* --- guided walkthroughs ------------------------------------------ */
+
+const SCENARIOS = [
+  {
+    name: 'A normal call',
+    blurb: `The ordinary case, so you can see the baseline. The editor asks for a tool list and the
+            server answers it.`,
+    watch: `Both columns behave identically. Nothing interesting should happen here — that is the point.`,
+    steps: [
+      { label: 'Editor calls tools/list',   action: { type: 'EDITOR_CALLS', id: 'A', method: 'tools/list' } },
+      { label: 'Server answers tools/list', action: { type: 'SERVER_ANSWERS', id: 'A' } },
+    ],
+  },
+  {
+    name: 'One call the server refuses',
+    blurb: `The real reported bug. The connection is perfectly healthy — one specific call is the
+            problem. Two calls are in the air at once, and only the second one is bad.`,
+    watch: `Two things. <strong>Collateral damage:</strong> at step 4, today's rule has already
+            swept the innocent tools/list into the buffer, so the server answering it does nothing.
+            <strong>The wrong answer:</strong> today the editor waits until step 7 and is then told
+            "transport error" — the proposed rule answers at step 3 and names the call that failed.`,
+    steps: [
+      { label: 'Editor calls tools/list',        action: { type: 'EDITOR_CALLS', id: 'A', method: 'tools/list' } },
+      { label: 'Editor calls tools/call',        action: { type: 'EDITOR_CALLS', id: 'B', method: 'tools/call' } },
+      { label: 'Server refuses tools/call',      action: { type: 'SERVER_REFUSES_ONE_CALL', id: 'B' } },
+      { label: 'Server answers tools/list',      action: { type: 'SERVER_ANSWERS', id: 'A' } },
+      { label: 'Reconnect succeeds',             action: { type: 'RECONNECT_SUCCEEDS' } },
+      { label: 'Server answers tools/list',      action: { type: 'SERVER_ANSWERS', id: 'A' } },
+      { label: 'Server refuses tools/call again', action: { type: 'SERVER_REFUSES_ONE_CALL', id: 'B' } },
+    ],
+  },
+  {
+    name: 'The server really did restart',
+    blurb: `The case buffering exists for, and the one the proposed rule must not break. The server
+            goes away mid-session, the editor asks for something while it is gone, then it comes back.`,
+    watch: `<strong>Both columns must end the same way.</strong> The call is held, replayed on
+            reconnect, and answered. If the proposed column loses the call here, the idea is wrong.`,
+    steps: [
+      { label: 'Connection drops',          action: { type: 'CONNECTION_DROPS' } },
+      { label: 'Editor calls tools/call',   action: { type: 'EDITOR_CALLS', id: 'B', method: 'tools/call' } },
+      { label: 'Reconnect succeeds',        action: { type: 'RECONNECT_SUCCEEDS' } },
+      { label: 'Server answers tools/call', action: { type: 'SERVER_ANSWERS', id: 'B' } },
+    ],
+  },
+  {
+    name: 'The server stays down',
+    blurb: `The server goes away and does not come back. The editor asks for something in the
+            meantime and the give-up timer eventually fires.`,
+    watch: `Both columns behave the same, and both make the editor wait twenty seconds for an
+            answer. Worth asking separately whether that wait is right.`,
+    steps: [
+      { label: 'Connection drops',            action: { type: 'CONNECTION_DROPS' } },
+      { label: 'Editor calls tools/call',     action: { type: 'EDITOR_CALLS', id: 'B', method: 'tools/call' } },
+      { label: 'Give-up timer fires (20s)',   action: { type: 'GIVE_UP_TIMER' } },
+    ],
+  },
+];
+
+let activeTab = 0;
+let activeStep = 0;
+
+document.getElementById('tabs').innerHTML = SCENARIOS
+  .map((s, i) => `<button class="tab" role="tab" data-tab="${i}">${i + 1}. ${s.name}</button>`).join('');
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const i = e.target.dataset.tab;
+  if (i === undefined) return;
+  activeTab = Number(i);
+  activeStep = 0;
+  dispatch({ type: 'RESET' });
+});
+
+document.getElementById('scenario').addEventListener('click', (e) => {
+  const i = e.target.dataset.step;
+  if (i === undefined) return;
+  activeStep = Number(i) + 1;
+  dispatch(SCENARIOS[activeTab].steps[Number(i)].action);
+});
+
+function renderScenario() {
+  const sc = SCENARIOS[activeTab];
+  document.querySelectorAll('.tab').forEach((t, i) =>
+    t.setAttribute('aria-selected', String(i === activeTab)));
+  document.getElementById('scenario').innerHTML = `
+    <p>${sc.blurb}</p>
+    <div class="watch"><strong>What to watch:</strong> ${sc.watch}</div>
+    <div class="steps">
+      ${sc.steps.map((st, i) => {
+        const done = activeStep !== null && i < activeStep;
+        const next = activeStep === i;
+        return `<div class="step ${done ? 'done' : ''} ${next ? 'next' : ''}">
+          <span class="step-num">${done ? '✓' : i + 1}</span>
+          <button data-step="${i}" ${next ? '' : 'disabled'}>${st.label}</button>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+dispatch({ type: 'RESET' });
+activeStep = 0;
+render();
+</script>
+</body>
+</html>
