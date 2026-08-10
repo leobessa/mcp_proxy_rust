@@ -1,7 +1,7 @@
 use crate::core::{
-    flush_buffer_with_errors, generate_id, initialized_notification,
-    initiate_post_reconnect_handshake, process_buffered_messages, process_client_request,
-    reply_disconnected, send_heartbeat_if_needed, try_reconnect,
+    flush_buffer_with_errors, initialized_notification, initiate_post_reconnect_handshake,
+    process_buffered_messages, process_client_request, reply_disconnected,
+    send_heartbeat_if_needed, try_reconnect,
 };
 use crate::{McpTransport, StdoutSink, TRANSPORT_SEND_ERROR_CODE};
 use anyhow::Result;
@@ -11,11 +11,10 @@ use rmcp::model::{
     ServerJsonRpcMessage, ServerResult,
 };
 use rmcp::transport::Transport;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Reasons why a reconnection attempt might fail.
 #[derive(Debug)]
@@ -59,8 +58,6 @@ pub struct AppState {
     pub connect_tries: u32,
     /// The initialization message (for reconnection)
     pub init_message: Option<ClientJsonRpcMessage>,
-    /// Map of generated IDs to original IDs (Client -> Server flow)
-    pub id_map: HashMap<String, RequestId>,
     /// Buffer for holding messages during reconnection
     pub in_buf: Vec<ClientJsonRpcMessage>,
     /// Buffer mode (store or fail)
@@ -93,7 +90,6 @@ impl AppState {
             state: ProxyState::Connecting,
             connect_tries: 0,
             init_message: None,
-            id_map: HashMap::new(),
             in_buf: Vec::new(),
             buf_mode: BufferMode::Store,
             flush_timer_active: false,
@@ -225,26 +221,10 @@ impl AppState {
             Some(mut message) => {
                 self.update_heartbeat();
 
-                // --- Handle Server-Initiated Request ---
-                if let ServerJsonRpcMessage::Request(mut req) = message {
-                    let server_id = req.id.clone();
-                    let proxy_id_str = generate_id();
-                    let proxy_id = RequestId::String(proxy_id_str.clone().into());
-                    debug!(
-                        "Mapping server request ID {} to proxy ID {}",
-                        server_id, proxy_id
-                    );
-                    self.id_map.insert(proxy_id_str, server_id);
-                    req.id = proxy_id;
-                    message = ServerJsonRpcMessage::Request(req);
-                    // Now fall through to forward the modified request
-                }
-                // --- End Server-Initiated Request Handling ---
-                else {
-                    match self.map_server_response_error_id(message) {
-                        Some(mapped_message) => message = mapped_message,
-                        None => return Ok(true), // Skip forwarding this message
-                    }
+                // Server-initiated requests are forwarded untouched: their ids
+                // live in the server-to-client direction, which never collides
+                // with the client-to-server one.
+                if !matches!(message, ServerJsonRpcMessage::Request(_)) {
                     // --- Handle Initialization Response --- (Only for Response/Error)
                     // Carries the request id so the handshake failure path below
                     // can answer that exact request without re-matching.
@@ -478,110 +458,6 @@ impl AppState {
             }
         }
         Ok(())
-    }
-
-    // --- ID Mapping Helpers ---
-    fn lookup_and_remove_original_id(&mut self, current_id: &RequestId) -> Option<RequestId> {
-        let lookup_key = current_id.to_string();
-        self.id_map.remove(&lookup_key)
-    }
-
-    // Add the client mapping logic here
-    pub(crate) fn map_client_response_error_id(
-        &mut self,
-        message: ClientJsonRpcMessage,
-    ) -> Option<ClientJsonRpcMessage> {
-        let (id_to_check, is_response_or_error) = match &message {
-            ClientJsonRpcMessage::Response(res) => (Some(res.id.clone()), true),
-            ClientJsonRpcMessage::Error(err) => (Some(err.id.clone()), true),
-            _ => (None, false), // Requests or Notifications are not mapped back this way
-        };
-
-        if is_response_or_error {
-            if let Some(current_id) = id_to_check {
-                if let Some(original_id) = self.lookup_and_remove_original_id(&current_id) {
-                    debug!(
-                        "Mapping client message ID {} back to original server ID: {}",
-                        current_id, original_id
-                    );
-                    return Some(match message {
-                        ClientJsonRpcMessage::Response(mut res) => {
-                            res.id = original_id;
-                            ClientJsonRpcMessage::Response(res)
-                        }
-                        ClientJsonRpcMessage::Error(mut err) => {
-                            err.id = original_id;
-                            ClientJsonRpcMessage::Error(err)
-                        }
-                        _ => message, // Should not happen
-                    });
-                } else {
-                    // ID not found, return None to prevent forwarding
-                    warn!(
-                        "Received client response/error with unknown ID: {}, skipping forwarding.",
-                        current_id
-                    );
-                    return None;
-                }
-            } else {
-                // Error message has no ID (should not happen for JSON-RPC errors)
-                warn!("Received client error message without an ID, skipping forwarding.");
-                return None;
-            }
-        }
-        // Not a response/error, return Some(original_message)
-        Some(message)
-    }
-
-    /// Checks if a server message (Response or Error) has an ID corresponding
-    /// to a mapped client request ID. If found, replaces the message's ID with
-    /// the original client ID and returns `Some` modified message.
-    /// Otherwise, returns `None`.
-    // Renamed from try_map_server_message_id and made private
-    pub(crate) fn map_server_response_error_id(
-        &mut self,
-        message: ServerJsonRpcMessage,
-    ) -> Option<ServerJsonRpcMessage> {
-        let (id_to_check, is_response_or_error) = match &message {
-            ServerJsonRpcMessage::Response(res) => (Some(res.id.clone()), true),
-            ServerJsonRpcMessage::Error(err) => (Some(err.id.clone()), true),
-            _ => (None, false), // Notifications or Requests are not mapped back
-        };
-
-        if is_response_or_error {
-            if let Some(current_id) = id_to_check {
-                if let Some(original_id) = self.lookup_and_remove_original_id(&current_id) {
-                    debug!(
-                        "Mapping server message ID {} back to original client ID: {}",
-                        current_id, original_id
-                    );
-                    return Some(match message {
-                        ServerJsonRpcMessage::Response(mut res) => {
-                            res.id = original_id;
-                            ServerJsonRpcMessage::Response(res)
-                        }
-                        ServerJsonRpcMessage::Error(mut err) => {
-                            err.id = original_id;
-                            ServerJsonRpcMessage::Error(err)
-                        }
-                        _ => message, // Should not happen due to is_response_or_error check
-                    });
-                } else {
-                    // ID not found, return None to prevent forwarding
-                    warn!(
-                        "Received server response/error with unknown ID: {}, skipping forwarding.",
-                        current_id
-                    );
-                    return None;
-                }
-            } else {
-                // Error message has no ID (should not happen for JSON-RPC errors)
-                warn!("Received server error message without an ID, skipping forwarding.");
-                return None;
-            }
-        }
-        // Not a response/error, return Some(original_message)
-        Some(message)
     }
 
     fn maybe_overwrite_protocol_version(

@@ -11,13 +11,8 @@ use rmcp::model::{
 use rmcp::transport::Transport;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use tracing::{debug, error, info};
-use uuid::Uuid;
 
 pub(crate) type TransportError = <McpTransport as Transport<rmcp::RoleClient>>::Error;
-
-pub(crate) fn generate_id() -> String {
-    Uuid::now_v7().to_string()
-}
 
 /// Renders a transport error together with everything underneath it.
 ///
@@ -110,7 +105,10 @@ pub(crate) async fn reply_disconnected(id: &RequestId, stdout_sink: &mut StdoutS
 }
 
 pub(crate) async fn connect(app_state: &AppState) -> Result<McpTransport> {
-    let mut config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(app_state.url.clone());
+    let mut config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+            app_state.url.clone(),
+        );
     config.retry_config = std::sync::Arc::new(NeverRetrySse);
     config.channel_buffer_capacity = 16;
     // Stateless servers never issue a session id and have no SSE channel; both
@@ -177,7 +175,6 @@ pub(crate) async fn try_reconnect(
 pub(crate) async fn send_request_to_server(
     transport: &mut McpTransport,
     request: ClientJsonRpcMessage,
-    original_message: ClientJsonRpcMessage,
     stdout_sink: &mut StdoutSink,
     app_state: &mut AppState,
 ) -> Result<bool> {
@@ -195,7 +192,7 @@ pub(crate) async fn send_request_to_server(
             if is_session_fatal(&e) {
                 app_state.handle_fatal_transport_error();
                 app_state
-                    .maybe_handle_message_while_disconnected(original_message, stdout_sink)
+                    .maybe_handle_message_while_disconnected(request, stdout_sink)
                     .await?;
                 return Ok(false);
             }
@@ -203,11 +200,10 @@ pub(crate) async fn send_request_to_server(
             // The connection is fine and only this call was refused. Say so, to
             // the request that actually failed, rather than tearing the session
             // down and reporting a transport problem several steps later.
-            match &original_message {
-                ClientJsonRpcMessage::Request(req) => {
-                    reply_request_failed(&req.id, &method, &detail, stdout_sink).await?;
-                }
-                other => error!("Cannot report send failure for {:?}", other),
+            if let ClientJsonRpcMessage::Request(req) = &request {
+                reply_request_failed(&req.id, &method, &detail, stdout_sink).await?;
+            } else {
+                error!("Cannot report send failure for {:?}", request);
             }
 
             Ok(false)
@@ -221,11 +217,6 @@ pub(crate) async fn process_client_request(
     transport: &mut McpTransport,
     stdout_sink: &mut StdoutSink,
 ) -> Result<()> {
-    let message = match app_state.map_client_response_error_id(message) {
-        Some(msg) => msg,
-        None => return Ok(()),
-    };
-
     match app_state
         .maybe_handle_message_while_disconnected(message.clone(), stdout_sink)
         .await
@@ -258,31 +249,9 @@ pub(crate) async fn process_client_request(
         _ => {}
     }
 
-    let original_message = message.clone();
-    if let ClientJsonRpcMessage::Request(req) = message {
-        let request_id = req.id.clone();
-        let mut req = req.clone();
+    if let ClientJsonRpcMessage::Request(req) = &message {
         debug!("Forwarding request from stdin to server: {:?}", req);
-
-        let new_id = generate_id();
-        let new_request_id = RequestId::String(new_id.clone().into());
-        req.id = new_request_id;
-        app_state.id_map.insert(new_id.clone(), request_id.clone());
-
-        let delivered = send_request_to_server(
-            transport,
-            ClientJsonRpcMessage::Request(req),
-            original_message,
-            stdout_sink,
-            app_state,
-        )
-        .await?;
-        if !delivered {
-            // Either the request was answered directly or it was buffered for
-            // replay under a freshly generated id. Nothing will ever come back
-            // under this one, so drop the mapping instead of leaking it.
-            app_state.id_map.remove(&new_id);
-        }
+        send_request_to_server(transport, message, stdout_sink, app_state).await?;
         return Ok(());
     }
 
@@ -307,13 +276,8 @@ pub(crate) async fn process_buffered_messages(
         match &message {
             ClientJsonRpcMessage::Request(req) => {
                 let request_id = req.id.clone();
-                let mut req = req.clone();
 
-                let new_id = generate_id();
-                req.id = RequestId::String(new_id.clone().into());
-                app_state.id_map.insert(new_id, request_id.clone());
-
-                if let Err(e) = transport.send(ClientJsonRpcMessage::Request(req)).await {
+                if let Err(e) = transport.send(message.clone()).await {
                     let detail = describe_transport_error(&e);
                     error!("Error sending buffered request: {}", detail);
                     let error_response = ServerJsonRpcMessage::error(
@@ -350,11 +314,6 @@ pub(crate) async fn flush_buffer_with_errors(
 
     let buffered_messages = std::mem::take(&mut app_state.in_buf);
     app_state.buf_mode = BufferMode::Fail;
-
-    if !app_state.id_map.is_empty() {
-        debug!("Clearing ID map with {} entries", app_state.id_map.len());
-        app_state.id_map.clear();
-    }
 
     for message in buffered_messages {
         if let ClientJsonRpcMessage::Request(request) = message {
@@ -420,9 +379,7 @@ pub(crate) async fn send_heartbeat_if_needed(
                 Some(false)
             }
             None => {
-                debug!(
-                    "Heartbeat check: No immediate message/event, assuming alive."
-                );
+                debug!("Heartbeat check: No immediate message/event, assuming alive.");
                 Some(true)
             }
         }
