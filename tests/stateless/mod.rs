@@ -3,6 +3,9 @@
 //! The whole surface is: POST returns `content-type: application/json` with no
 //! `mcp-session-id` header, and GET returns 405 (no server-to-client channel).
 
+// Shared by several test binaries; each uses only part of it.
+#![allow(dead_code)]
+
 use axum::{
     Router,
     body::Body,
@@ -41,6 +44,7 @@ pub enum NotificationReply {
 #[derive(Clone)]
 pub struct StatelessServer {
     notification_reply: NotificationReply,
+    abort_tools_call: bool,
     post_count: Arc<AtomicUsize>,
     get_count: Arc<AtomicUsize>,
 }
@@ -49,9 +53,18 @@ impl StatelessServer {
     pub fn new(notification_reply: NotificationReply) -> Self {
         Self {
             notification_reply,
+            abort_tools_call: false,
             post_count: Arc::new(AtomicUsize::new(0)),
             get_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Answers `tools/call` by sending response headers and then dropping the
+    /// connection mid-body. The connection itself is fine and every other
+    /// method still works -- only this one call is unanswerable.
+    pub fn aborting_tools_call(mut self) -> Self {
+        self.abort_tools_call = true;
+        self
     }
 
     pub fn post_count(&self) -> usize {
@@ -140,6 +153,18 @@ async fn handle(
             }
         };
     };
+
+    if method == "tools/call" && server.abort_tools_call {
+        let aborting = futures::stream::once(async {
+            Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other("connection aborted"))
+        });
+        let mut response = Response::new(Body::from_stream(aborting));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
 
     let result = match method {
         "initialize" => json!({
