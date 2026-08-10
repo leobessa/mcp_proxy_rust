@@ -112,3 +112,15 @@ Other supported flags:
 
 * `--max-disconnected-time` the maximum amount of time for trying to reconnect while disconnected. When not set, defaults to infinity.
 * `--override-protocol-version` to override the protocol version reported by the proxy. This is useful when using the proxy with a client that expects a different protocol version, when the only reason for mismatching protocols is the use of streamable / SSE transports.
+
+## Server compatibility
+
+Streamable HTTP gives servers a lot of latitude, and `mcp-proxy` aims to work with all of it. In particular, a server does **not** have to be stateful:
+
+* **No session.** If the `initialize` response carries no `mcp-session-id`, the proxy runs the session statelessly rather than refusing to connect.
+* **No server-to-client channel.** If `GET` on the endpoint returns 405 (or anything else unusable), the proxy carries on with a POST-only session instead of treating it as a connection failure.
+* **Plain JSON replies.** Every POST may be answered inline. The proxy identifies a response by parsing its body, so an unexpected or absent `content-type` does not lose the message, and a JSON-RPC error delivered with a non-2xx status is passed through to the client as an error rather than as a transport failure.
+
+Between them these cover a fully stateless plain-JSON JSON-RPC endpoint, which is the smallest thing that can call itself an MCP server.
+
+If a connection genuinely cannot carry an MCP session, the proxy fails at `initialize` rather than reporting success and failing later — so a client that only performs the handshake will not show a broken server as connected.

@@ -1,16 +1,16 @@
 use crate::core::{
-    flush_buffer_with_errors, generate_id, initiate_post_reconnect_handshake,
-    process_buffered_messages, process_client_request, reply_disconnected,
-    send_heartbeat_if_needed, try_reconnect,
+    flush_buffer_with_errors, generate_id, initialized_notification,
+    initiate_post_reconnect_handshake, process_buffered_messages, process_client_request,
+    reply_disconnected, send_heartbeat_if_needed, try_reconnect,
 };
-use crate::{McpTransport, StdoutSink};
+use crate::{McpTransport, StdoutSink, TRANSPORT_SEND_ERROR_CODE};
 use anyhow::Result;
 use futures::SinkExt;
-use rmcp::transport::Transport;
 use rmcp::model::{
-    ClientJsonRpcMessage, ClientNotification, ClientRequest, EmptyResult, InitializedNotification,
-    InitializedNotificationMethod, ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerResult,
+    ClientJsonRpcMessage, ClientRequest, EmptyResult, ErrorData, ProtocolVersion, RequestId,
+    ServerJsonRpcMessage, ServerResult,
 };
+use rmcp::transport::Transport;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
@@ -40,7 +40,6 @@ pub enum ProxyState {
     WaitingForClientInit,
     WaitingForServerInit(RequestId),
     WaitingForServerInitHidden(RequestId),
-    WaitingForClientInitialized,
 }
 
 /// Application state for the proxy
@@ -247,40 +246,36 @@ impl AppState {
                         None => return Ok(true), // Skip forwarding this message
                     }
                     // --- Handle Initialization Response --- (Only for Response/Error)
-                    let is_init_response = match &message {
+                    // Carries the request id so the handshake failure path below
+                    // can answer that exact request without re-matching.
+                    let init_response_id = match &message {
                         ServerJsonRpcMessage::Response(response) => match self.state {
-                            ProxyState::WaitingForServerInit(ref init_request_id) => {
-                                *init_request_id == response.id
+                            ProxyState::WaitingForServerInit(ref init_request_id)
+                            | ProxyState::WaitingForServerInitHidden(ref init_request_id)
+                                if *init_request_id == response.id =>
+                            {
+                                Some(response.id.clone())
                             }
-                            ProxyState::WaitingForServerInitHidden(ref init_request_id) => {
-                                *init_request_id == response.id
-                            }
-                            _ => false,
+                            _ => None,
                         },
                         // Don't treat errors related to init ID as special init responses
-                        _ => false,
+                        _ => None,
                     };
 
                     debug!(
                         "Handling initialization response - state: {:?}, message: {:?}, is_init_response: {}",
-                        self.state, message, is_init_response
+                        self.state,
+                        message,
+                        init_response_id.is_some()
                     );
 
-                    if is_init_response {
+                    if let Some(init_response_id) = init_response_id {
                         let was_hidden =
                             matches!(self.state, ProxyState::WaitingForServerInitHidden(_));
                         if was_hidden {
                             self.connected();
                             debug!("Reconnection successful, received hidden init response");
-                            let initialized_notification = ClientJsonRpcMessage::notification(
-                                ClientNotification::InitializedNotification(
-                                    InitializedNotification {
-                                        method: InitializedNotificationMethod,
-                                        extensions: rmcp::model::Extensions::default(),
-                                    },
-                                ),
-                            );
-                            if let Err(e) = transport.send(initialized_notification).await {
+                            if let Err(e) = self.complete_handshake(transport).await {
                                 error!(
                                     "Error sending initialized notification post-reconnect: {}",
                                     e
@@ -290,13 +285,36 @@ impl AppState {
                                 process_buffered_messages(self, transport, stdout_sink).await?;
                             }
                             return Ok(true); // Don't forward the init response
-                        } else {
-                            debug!(
-                                "Initial connection successful, received init response. Waiting for client initialized."
-                            );
-                            self.state = ProxyState::WaitingForClientInitialized;
-                            message = self.maybe_overwrite_protocol_version(message);
                         }
+
+                        // The handshake must finish before the client is told it
+                        // succeeded. If it cannot, the session is unusable, and
+                        // answering `initialize` with a success would leave the
+                        // client reporting a healthy connection while every
+                        // subsequent call fails.
+                        if let Err(e) = self.complete_handshake(transport).await {
+                            error!("Handshake failed after initialize response: {}", e);
+                            let error_response = ServerJsonRpcMessage::error(
+                                ErrorData::new(
+                                    TRANSPORT_SEND_ERROR_CODE,
+                                    format!(
+                                        "Server accepted initialize but the connection cannot carry \
+                                         an MCP session: {e}"
+                                    ),
+                                    None,
+                                ),
+                                init_response_id,
+                            );
+                            if let Err(write_err) = stdout_sink.send(error_response).await {
+                                error!("Error writing initialize error to stdout: {}", write_err);
+                                return Ok(false);
+                            }
+                            self.handle_fatal_transport_error();
+                            return Ok(true);
+                        }
+
+                        debug!("Initial connection successful, handshake complete.");
+                        message = self.maybe_overwrite_protocol_version(message);
                     }
                     // --- End Initialization Response Handling ---
                 }
@@ -317,6 +335,24 @@ impl AppState {
                 Ok(true)
             }
         }
+    }
+
+    /// Sends `notifications/initialized` and marks the proxy connected.
+    ///
+    /// The proxy sends this itself rather than waiting for the client's copy,
+    /// for two reasons. First, the Streamable HTTP worker treats the second
+    /// message it is handed as the initialized notification and will not return
+    /// a response for anything else -- a client that skips the notification
+    /// would have its first real request silently consumed. Second, this send
+    /// is the only round trip that proves the connection can carry a session,
+    /// so it doubles as the liveness check behind the `initialize` reply.
+    pub(crate) async fn complete_handshake(
+        &mut self,
+        transport: &mut McpTransport,
+    ) -> Result<(), <McpTransport as Transport<rmcp::RoleClient>>::Error> {
+        transport.send(initialized_notification()).await?;
+        self.connected();
+        Ok(())
     }
 
     pub(crate) async fn maybe_handle_message_while_disconnected(

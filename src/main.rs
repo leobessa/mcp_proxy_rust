@@ -14,6 +14,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod cli;
 mod core;
+mod http_client;
 mod state;
 
 use crate::cli::Args;
@@ -23,7 +24,7 @@ use crate::state::{AppState, ProxyState};
 const DISCONNECTED_ERROR_CODE: ErrorCode = ErrorCode(-32010);
 const TRANSPORT_SEND_ERROR_CODE: ErrorCode = ErrorCode(-32011);
 
-pub(crate) type McpTransport = StreamableHttpClientTransport<reqwest::Client>;
+pub(crate) type McpTransport = StreamableHttpClientTransport<http_client::TolerantHttpClient>;
 
 type StdinCodec = rmcp::transport::async_rw::JsonRpcMessageCodec<ClientJsonRpcMessage>;
 type StdoutCodec = rmcp::transport::async_rw::JsonRpcMessageCodec<ServerJsonRpcMessage>;
