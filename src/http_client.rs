@@ -112,7 +112,17 @@ impl StreamableHttpClient for TolerantHttpClient {
 
         // Everything else is read to completion, both so the body can be
         // inspected and so the connection goes back to the pool clean.
-        let body = response.text().await.unwrap_or_default();
+        //
+        // A body that cannot be read is a real failure, not an empty body:
+        // treating a truncated response as "nothing to say" would silently
+        // strand the request that is waiting for it.
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                warn!("could not read response body: {e}");
+                return Err(StreamableHttpError::Client(e));
+            }
+        };
 
         // The body is the authority. A server that answers a request inline has
         // answered it, whatever it labelled the response as -- including with a

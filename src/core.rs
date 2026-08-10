@@ -9,11 +9,87 @@ use rmcp::model::{
     InitializedNotificationMethod, RequestId, ServerJsonRpcMessage,
 };
 use rmcp::transport::Transport;
+use rmcp::transport::streamable_http_client::StreamableHttpError;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+pub(crate) type TransportError = <McpTransport as Transport<rmcp::RoleClient>>::Error;
+
 pub(crate) fn generate_id() -> String {
     Uuid::now_v7().to_string()
+}
+
+/// Renders a transport error together with everything underneath it.
+///
+/// The outermost message is nearly useless on its own: every HTTP-level
+/// failure renders as `Client error: error sending request for url (...)`,
+/// whether the server was unreachable, hung up mid-response, or spoke
+/// nonsense. The cause that tells them apart lives further down the
+/// `source()` chain, and reporting only the top layer throws away the one
+/// piece of information a reader needs.
+pub(crate) fn describe_transport_error(e: &TransportError) -> String {
+    let mut parts = vec![e.to_string()];
+    // `StreamableHttpError::Client` does not expose its inner error as a
+    // `source`, so step into it explicitly before walking the chain.
+    let mut cause = match e {
+        StreamableHttpError::Client(inner) => std::error::Error::source(inner),
+        other => std::error::Error::source(other),
+    };
+    while let Some(err) = cause {
+        parts.push(err.to_string());
+        cause = err.source();
+    }
+    parts.join(": ")
+}
+
+/// Whether a failure to send means the whole session is gone, or just that one
+/// request was not accepted.
+///
+/// Getting this wrong in either direction is costly. Treating every failure as
+/// fatal — which is what the proxy used to do — tears down a working session
+/// over a single bad call and leaves the client waiting on a request it will
+/// never hear about. Treating a genuinely dead server as a per-request problem
+/// would lose the buffering that rides out a restart.
+fn is_session_fatal(e: &TransportError) -> bool {
+    match e {
+        // The worker is gone; nothing can be sent on this transport again.
+        StreamableHttpError::TransportChannelClosed => true,
+        // The session itself is the problem, so a fresh handshake is the fix.
+        StreamableHttpError::SessionExpired
+        | StreamableHttpError::MissingSessionIdInResponse
+        | StreamableHttpError::AuthRequired(_)
+        | StreamableHttpError::InsufficientScope(_) => true,
+        // We could not reach the server at all — it is down, not fussy.
+        // Buffering and reconnecting is exactly what should happen here.
+        StreamableHttpError::Client(inner) => inner.is_connect(),
+        // The exchange happened and the server did not accept this request.
+        // The connection is still good; only this call failed.
+        _ => false,
+    }
+}
+
+/// Answers a single request that the server would not accept, leaving the
+/// session untouched.
+async fn reply_request_failed(
+    id: &RequestId,
+    method: &str,
+    detail: &str,
+    stdout_sink: &mut StdoutSink,
+) -> Result<()> {
+    let error_response = ServerJsonRpcMessage::error(
+        ErrorData::new(
+            TRANSPORT_SEND_ERROR_CODE,
+            format!("The server did not accept this {method} request: {detail}"),
+            None,
+        ),
+        id.clone(),
+    );
+
+    if let Err(e) = stdout_sink.send(error_response).await {
+        error!("Error writing request failure to stdout: {}", e);
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn reply_disconnected(id: &RequestId, stdout_sink: &mut StdoutSink) -> Result<()> {
@@ -106,14 +182,33 @@ pub(crate) async fn send_request_to_server(
     app_state: &mut AppState,
 ) -> Result<bool> {
     debug!("Sending request to server: {:?}", request);
+    let method = match &request {
+        ClientJsonRpcMessage::Request(req) => req.request.method().to_string(),
+        _ => "unknown".to_string(),
+    };
     match transport.send(request.clone()).await {
         Ok(_) => Ok(true),
         Err(e) => {
-            error!("Error sending to server: {}", e);
-            app_state.handle_fatal_transport_error();
-            app_state
-                .maybe_handle_message_while_disconnected(original_message, stdout_sink)
-                .await?;
+            let detail = describe_transport_error(&e);
+            error!("Error sending {} to server: {}", method, detail);
+
+            if is_session_fatal(&e) {
+                app_state.handle_fatal_transport_error();
+                app_state
+                    .maybe_handle_message_while_disconnected(original_message, stdout_sink)
+                    .await?;
+                return Ok(false);
+            }
+
+            // The connection is fine and only this call was refused. Say so, to
+            // the request that actually failed, rather than tearing the session
+            // down and reporting a transport problem several steps later.
+            match &original_message {
+                ClientJsonRpcMessage::Request(req) => {
+                    reply_request_failed(&req.id, &method, &detail, stdout_sink).await?;
+                }
+                other => error!("Cannot report send failure for {:?}", other),
+            }
 
             Ok(false)
         }
@@ -172,9 +267,9 @@ pub(crate) async fn process_client_request(
         let new_id = generate_id();
         let new_request_id = RequestId::String(new_id.clone().into());
         req.id = new_request_id;
-        app_state.id_map.insert(new_id, request_id.clone());
+        app_state.id_map.insert(new_id.clone(), request_id.clone());
 
-        let _success = send_request_to_server(
+        let delivered = send_request_to_server(
             transport,
             ClientJsonRpcMessage::Request(req),
             original_message,
@@ -182,6 +277,12 @@ pub(crate) async fn process_client_request(
             app_state,
         )
         .await?;
+        if !delivered {
+            // Either the request was answered directly or it was buffered for
+            // replay under a freshly generated id. Nothing will ever come back
+            // under this one, so drop the mapping instead of leaking it.
+            app_state.id_map.remove(&new_id);
+        }
         return Ok(());
     }
 
@@ -213,11 +314,12 @@ pub(crate) async fn process_buffered_messages(
                 app_state.id_map.insert(new_id, request_id.clone());
 
                 if let Err(e) = transport.send(ClientJsonRpcMessage::Request(req)).await {
-                    error!("Error sending buffered request: {}", e);
+                    let detail = describe_transport_error(&e);
+                    error!("Error sending buffered request: {}", detail);
                     let error_response = ServerJsonRpcMessage::error(
                         ErrorData::new(
                             TRANSPORT_SEND_ERROR_CODE,
-                            format!("Transport error: {}", e),
+                            format!("Transport error: {detail}"),
                             None,
                         ),
                         request_id,
