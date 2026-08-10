@@ -80,3 +80,33 @@ jobs:
         if: github.ref_type == 'tag'
         with:
           files: 'mcp-proxy-${{ matrix.platform.target }}.*'
+          # Explicit: the action preserves an existing release's draft flag when
+          # this input is unset, so a re-run over a draft release would silently
+          # upload assets and never publish them.
+          draft: false
+          make_latest: true
+
+  checksums:
+    name: Checksums
+    needs: release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum mcp-proxy-* > ../SHA256SUMS
+          cat ../SHA256SUMS
+      - name: Attach SHA256SUMS to release
+        uses: softprops/action-gh-release@39ba0b9d81217c984acfad95ddcc7db226387497
+        with:
+          files: SHA256SUMS
+          draft: false
+          make_latest: true
